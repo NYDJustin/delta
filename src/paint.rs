@@ -725,11 +725,19 @@ pub fn get_syntax_style_sections_for_lines<'a>(
                             .unwrap(),
                     );
                 } else {
-                    let line_syntax = ansi::truncate_str_short(line, config.max_syntax_length);
                     // Re-split to get references into `line` with correct lifetimes.
-                    // SAFETY: slicing the string is safe because `truncate_str_short` always
-                    // returns a prefix of the input and only cuts at grapheme borders.
-                    let (with_syntax, plain) = line.split_at(line_syntax.len());
+                    // The split index must be computed in `line` itself: the byte
+                    // length of the string returned by `truncate_str_short` is not
+                    // a valid split point, because that string may contain ANSI
+                    // escape sequences and zero-width graphemes from after the cut
+                    // point (see `truncate_str_short_index`). Using its length
+                    // panicked on lines containing such sequences followed by
+                    // multi-byte characters, e.g. a line made invalid UTF-8 by
+                    // git, lossily decoded to U+FFFD characters, and containing
+                    // an embedded "\x1b[K" sequence (#2316).
+                    let split_index =
+                        ansi::truncate_str_short_index(line, config.max_syntax_length);
+                    let (with_syntax, plain) = line.split_at(split_index);
                     // Note: splitting a line and only feeding one half to the highlighter may
                     // result in wrong highlighting until it is reset the next hunk.
                     //

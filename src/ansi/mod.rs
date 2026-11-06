@@ -99,10 +99,46 @@ pub fn truncate_str<'a>(s: &'a str, display_width: usize, tail: &str) -> Cow<'a,
 
 /// Truncate string `s` so it fits into `display_width`, ignoring any ANSI escape sequences when
 /// calculating the width. If a double-width ("fullwidth") grapheme has to be cut, it is omitted and
-/// the resulting string is *shorter* than `display_width`. But this way the result is always a
-/// prefix of the input `s`.
+/// the resulting string is *shorter* than `display_width`. The text content of the result is a
+/// prefix of the text content of `s`, but the result may also contain ANSI escape sequences
+/// from after the cut point, so it is not necessarily a byte prefix of `s` itself. Use
+/// `truncate_str_short_index` to obtain the corresponding byte offset in `s`.
+// Retained as the string-returning counterpart of `truncate_str_short_index`
+// and exercised by the unit tests for both functions.
+#[allow(dead_code)]
 pub fn truncate_str_short(s: &str, display_width: usize) -> Cow<'_, str> {
     truncate_str_impl(s, display_width, "", None)
+}
+
+/// Return the byte index in `s` at which `truncate_str_short` cuts `s` when
+/// truncating it to `display_width`, ignoring any ANSI escape sequences when
+/// calculating the width. The returned index is always a char boundary in
+/// `s`, and `&s[..index]` is the part of `s` that fits in `display_width`.
+///
+/// This cannot be derived from `truncate_str_short(s, display_width).len()`:
+/// the truncated string may contain ANSI escape sequences that occur after
+/// the cut point in `s` (they are retained so that styling is terminated
+/// correctly), and it may contain zero-width graphemes from after the cut
+/// point. Its byte length is therefore not, in general, a byte offset in
+/// `s`, and using it as one can land inside a multi-byte character.
+pub fn truncate_str_short_index(s: &str, display_width: usize) -> usize {
+    let mut used = 0;
+    let mut byte_pos = 0;
+    for (chunk, is_ansi) in ansi_strings_iterator(s) {
+        if is_ansi {
+            byte_pos += chunk.len();
+            continue;
+        }
+        for (grapheme_offset, grapheme) in chunk.grapheme_indices(true) {
+            let width_of_grapheme = grapheme.width();
+            if used + width_of_grapheme > display_width {
+                return byte_pos + grapheme_offset;
+            }
+            used += width_of_grapheme;
+        }
+        byte_pos += chunk.len();
+    }
+    s.len()
 }
 
 /// Split `s` into lines that are at most `display_width` wide, ignoring any ANSI escape sequences
@@ -291,7 +327,7 @@ mod tests {
     use super::{
         ansi_preserving_index, ansi_preserving_slice, measure_text_width, parse_first_style,
         string_starts_with_ansi_style_sequence, strip_ansi_codes, truncate_str, truncate_str_short,
-        wrap_str,
+        truncate_str_short_index, wrap_str,
     };
 
     #[test]
@@ -432,6 +468,43 @@ mod tests {
         assert_eq!(truncate_str_short(double, 0), "");
         assert_eq!(truncate_str_short(double, 1), "");
         assert_eq!(truncate_str_short(double, 2), double);
+    }
+
+    #[test]
+    fn test_truncate_str_short_index() {
+        assert_eq!(truncate_str_short_index("123", 3), 3);
+        assert_eq!(truncate_str_short_index("123", 2), 2);
+        assert_eq!(truncate_str_short_index("123", 0), 0);
+        assert_eq!(truncate_str_short_index("", 0), 0);
+        // A multi-byte character is never cut in half: U+FFFD is 3 bytes
+        // wide and 1 column wide, so 2 columns hold exactly 2 characters.
+        let s = "�".repeat(10);
+        assert_eq!(truncate_str_short_index(&s, 2), 6);
+        assert_eq!(&s[..truncate_str_short_index(&s, 2)], "��");
+        // A double-width grapheme that does not fit is omitted entirely.
+        assert_eq!(truncate_str_short_index("1＃4", 2), 1);
+        assert_eq!(truncate_str_short_index("1＃4", 3), 4);
+    }
+
+    #[test]
+    fn test_truncate_str_short_index_with_ansi_after_cut() {
+        // The truncated string retains the ANSI sequence from after the cut
+        // point, so its length is not a byte offset in the input. The index
+        // must point at the cut in the input itself. This is the shape of
+        // the line in https://github.com/dandavison/delta/issues/2316: many
+        // U+FFFD characters, followed by an ANSI sequence and a newline.
+        let s = format!("{}\x1b[K\n", "�".repeat(500));
+        let index = truncate_str_short_index(&s, 400);
+        assert_eq!(index, 400 * 3);
+        assert_eq!(&s[..index], "�".repeat(400).as_str());
+        // The length of the truncated string is longer than the index
+        // because it also contains "\x1b[K" and "\n" from after the cut,
+        // and 1204 is not a char boundary in `s`.
+        assert_eq!(truncate_str_short(&s, 400).len(), 1204);
+        assert!(!s.is_char_boundary(1204));
+        // ANSI sequences before the cut are part of the prefix.
+        let styled = "\x1b[31m12345\x1b[0m";
+        assert_eq!(truncate_str_short_index(styled, 3), 5 + 3);
     }
 
     #[test]
