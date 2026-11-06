@@ -2262,6 +2262,53 @@ src/align.rs:71: impl<'a> Alignment<'a> { │
     }
 
     #[test]
+    fn test_zero_line_with_invalid_utf8_and_ansi_sequence_does_not_panic() {
+        // Regression test for #2316. The context line below is not valid
+        // UTF-8 (500 copies of the single byte 0xa4) and it contains an
+        // embedded ANSI sequence ("\x1b[K") at the end, exactly as in the
+        // repro repository for that issue. Delta lossily decodes the bytes
+        // to 500 U+FFFD characters, and syntax highlighting of the line
+        // used to panic when the truncation point for
+        // --max-syntax-highlighting-length (400 by default) was derived
+        // from the byte length of the truncated string, which also
+        // contained the ANSI sequence and the trailing newline from after
+        // the cut point: 1204 is not a char boundary in the decoded line.
+        use bytelines::ByteLines;
+        use std::io::BufReader;
+
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(
+            b"diff --git a/file.txt b/file.txt\n\
+              index 30e86d9..05bd17a 100644\n\
+              --- a/file.txt\n\
+              +++ b/file.txt\n\
+              @@ -1 +1,2 @@\n ",
+        );
+        input.extend((0..500).map(|_| 0xa4u8));
+        input.extend_from_slice(b"\x1b[K\n+new line\n");
+
+        let config = integration_test_utils::make_config_from_args(&[]);
+        let _args = crate::utils::process::tests::FakeParentArgs::for_scope("");
+        let mut writer: Vec<u8> = Vec::new();
+        crate::delta::delta(
+            ByteLines::new(BufReader::new(&input[..])),
+            &mut writer,
+            &config,
+        )
+        .unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        let stripped = strip_ansi_codes(&output);
+        // The entire lossily decoded line is rendered, not just the part
+        // up to the syntax highlighting limit, and the added line follows.
+        assert_eq!(stripped.matches('\u{fffd}').count(), 500);
+        assert!(
+            stripped.contains("new line"),
+            "output does not contain the added line:\n{}",
+            stripped
+        );
+    }
+
+    #[test]
     fn test_color_only_diff_filter_zero_style_bg() {
         let result =
             DeltaTest::with_args(&["--color-only", r##"--zero-style='syntax "#1d1f21" dim'"##])
